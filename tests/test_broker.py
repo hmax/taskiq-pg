@@ -17,7 +17,7 @@ async def get_first_task(asyncpg_broker: AsyncpgBroker) -> AckableMessage:
     """
     Get the first message from the broker's listen method.
 
-    :param broker: Instance of AsyncpgBroker.
+    :param asyncpg_broker: Instance of AsyncpgBroker.
     :return: The first AckableMessage received.
     """
     async for message in asyncpg_broker.listen():
@@ -82,10 +82,10 @@ async def test_startup(asyncpg_broker: AsyncpgBroker) -> None:
     conn = await asyncpg.connect(asyncpg_broker.dsn)
     table_exists = await conn.fetchval(
         """
-        SELECT EXISTS (
-            SELECT FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_name = $1
-        )
+        SELECT EXISTS (SELECT
+                       FROM information_schema.tables
+                       WHERE table_schema = 'public'
+                         AND table_name = $1)
         """,
         asyncpg_broker.table_name,
     )
@@ -111,6 +111,7 @@ async def test_listen(asyncpg_broker: AsyncpgBroker) -> None:
         INSERT_MESSAGE_QUERY.format(asyncpg_broker.table_name),
         task_id,
         task_name,
+        "pending",
         message_content.decode(),
         json.dumps(labels),
     )
@@ -135,6 +136,7 @@ async def test_wrong_format(asyncpg_broker: AsyncpgBroker) -> None:
         INSERT_MESSAGE_QUERY.format(asyncpg_broker.table_name),
         "",  # Missing task_id
         "",  # Missing task_name
+        "pending",  # Status has to be correct
         "wrong",  # Message content
         json.dumps({}),  # Empty labels
     )
@@ -173,6 +175,84 @@ async def test_delayed_message(asyncpg_broker: AsyncpgBroker) -> None:
     # Wait for the delay to pass and receive the message
     message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=3.0)
     assert message.data == sent.message
+
+    # Acknowledge the message
+    await maybe_awaitable(message.ack())
+
+
+@pytest.mark.anyio
+async def test_message_assigned(asyncpg_broker: AsyncpgBroker) -> None:
+    # Insert a message directly into the database
+    conn = await asyncpg.connect(dsn=asyncpg_broker.dsn)
+    message_content = b"test_message"
+    task_id = uuid.uuid4().hex
+    task_name = "test_task"
+    labels = {"label1": "label_val"}
+    message_id = await conn.fetchval(
+        INSERT_MESSAGE_QUERY.format(asyncpg_broker.table_name),
+        task_id,
+        task_name,
+        "pending",
+        message_content.decode(),
+        json.dumps(labels),
+    )
+    # Send a NOTIFY with the message ID
+    await conn.execute(f"NOTIFY {asyncpg_broker.channel_name}, '{message_id}'")
+
+    # Listen for the message
+    message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+    assert message.data == message_content
+
+    # Send a NOTIFY with the message ID
+    await conn.execute(f"NOTIFY {asyncpg_broker.channel_name}, '{message_id}'")
+    await conn.close()
+
+    # Listen for the message, should be none since it is already assigned
+    with pytest.raises(TimeoutError):
+        message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+
+    # Acknowledge the message
+    await maybe_awaitable(message.ack())
+
+
+@pytest.mark.anyio
+async def test_orphaned_messages_requeried(asyncpg_broker: AsyncpgBroker) -> None:
+    # Insert a message directly into the database
+    conn = await asyncpg.connect(dsn=asyncpg_broker.dsn)
+    message_content = b"test_message"
+    task_id = uuid.uuid4().hex
+    task_name = "test_task"
+    labels = {"label1": "label_val"}
+    message_id = await conn.fetchval(
+        INSERT_MESSAGE_QUERY.format(asyncpg_broker.table_name),
+        task_id,
+        task_name,
+        "pending",
+        message_content.decode(),
+        json.dumps(labels),
+    )
+
+    # Send a NOTIFY with the message ID
+    await conn.execute(f"NOTIFY {asyncpg_broker.channel_name}, '{message_id}'")
+
+    await conn.execute(
+        "UPDATE {} SET notified_at = NOW() - INTERVAL '{} seconds' "  # noqa: S608
+        "WHERE task_id = $1".format(asyncpg_broker.table_name,
+                                    asyncpg_broker.max_execution_time_seconds + 1),
+        task_id,
+    )
+
+    message_ids = await asyncpg_broker._reassign_orphaned_tasks_db()
+    assert len(message_ids) == 1
+    assert message_ids[0] == message_id
+
+    # Send a NOTIFY with the message ID
+    await conn.execute(f"NOTIFY {asyncpg_broker.channel_name}, '{message_id}'")
+    await conn.close()
+
+    # Listen for the message
+    message = await asyncio.wait_for(get_first_task(asyncpg_broker), timeout=1.0)
+    assert message.data == message_content
 
     # Acknowledge the message
     await maybe_awaitable(message.ack())
